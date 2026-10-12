@@ -1,0 +1,34 @@
+From: ElementalWarrior
+Date: 2026-10-12
+Subject: Submit the queue in clFlush instead of dropping it
+
+Restore the real clFlush thunk; a no-op Flush stalls the GPU queue.
+
+0030 turned clFlush into `return CL_SUCCESS` on the theory that Flush is
+only a hint. In practice the host driver batches enqueued commands and
+Flush is what submits them: Affinity enqueues its startup compute work,
+registers a completion callback and waits for it. With nothing submitted
+the event never completes and the wait never ends, so OpenCL has to stay
+off entirely and Affinity loses GPU acceleration.
+
+Submit the queue for real and then pump any callbacks that are already
+due, so a Flush/Wait pair makes forward progress on its own. The thunk
+is one PE->unix round trip; the SRWLOCK/SwitchToThread work from 0030 is
+kept.
+
+--- a/dlls/opencl/pe_thunks.c	2026-10-12 09:30:20.132578436 -0300
++++ b/dlls/opencl/pe_thunks.c	2026-10-12 09:30:20.133515270 -0300
+@@ -463,8 +463,12 @@ cl_int WINAPI clFinish( cl_command_queue
+ 
+ cl_int WINAPI clFlush( cl_command_queue command_queue )
+ {
++    struct clFlush_params params = { command_queue };
++    cl_int ret;
+     TRACE( "(%p)\n", command_queue );
+-    return CL_SUCCESS;
++    ret = OPENCL_CALL( clFlush, &params );
++    check_completed_callbacks();
++    return ret;
+ }
+ 
+ cl_int WINAPI clGetCommandQueueInfo( cl_command_queue command_queue, cl_command_queue_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
