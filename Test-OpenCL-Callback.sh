@@ -41,7 +41,14 @@ if [ ! -f "$EXE" ] || [ "$SRC" -nt "$EXE" ]; then
   }
 fi
 
-export WINEPREFIX="$(mktemp -d /tmp/opencode-ocl-prefix.XXXXXX)"
+# A preset WINEPREFIX is reused as-is (recommended: stable on-disk prefix,
+# since fresh tmpfs prefixes are flaky); otherwise a throwaway is created.
+if [ -n "${WINEPREFIX:-}" ]; then
+  CLEANUP_PREFIX=0
+else
+  export WINEPREFIX="$(mktemp -d /tmp/opencode-ocl-prefix.XXXXXX)"
+  CLEANUP_PREFIX=1
+fi
 export WINEARCH=win64
 export WINEDEBUG="${WINEDEBUG:-+opencl}"
 echo "prefix=$WINEPREFIX"
@@ -49,7 +56,7 @@ echo "prefix=$WINEPREFIX"
 timeout 120 "$TREE/wine" "$EXE"
 rc=$?
 echo "repro exit=$rc"
-rm -rf "$WINEPREFIX"
+[ "$CLEANUP_PREFIX" = "1" ] && rm -rf "$WINEPREFIX"
 
 if [ $rc -eq 0 ]; then
   echo "PASS: callback delivered while waiting"

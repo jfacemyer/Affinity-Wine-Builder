@@ -38,7 +38,10 @@ wine-11.16.tar.xz
 # Wine 11.18 build artifacts
 wine-11.18.tar.xz
 /Test-OpenCL-Callback.exe
+/Test-OpenCL-Compute.exe
+/Test-OpenCL-Coverage.exe
 /wine-11.18/
 /ElementalWarrior-wine-11.18/
 /ElementalWarrior-wine-11.18.tar.xz
 /patches-alt
+*.xz

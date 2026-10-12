@@ -40,6 +40,23 @@ thread completes it, main thread waits 5 s with no further CL calls) hangs
 on `0061` and passes with `0062`–`0063`. Module `dlls/opencl` builds
 warning-free (only pre-existing `0021` `invalidate_kernel_args` warning).
 
+`0064`–`0068` complete the bridge toward 100% OpenCL coverage, in order:
+
+| | |
+|---|---|
+| `0064` opencl | Program build/compile/link notification callbacks fire synchronously in PE (host can't invoke them; NULL path unchanged) |
+| `0065` opencl | `clEnqueueNativeKernel` emulated on a helper thread (wait-list, run `user_func`, signal user event) instead of `CL_INVALID_OPERATION` |
+| `0066` opencl | Memory-object destructor callbacks via shadow refcounts (tracked creates fire exactly once at zero; foreign handles keep old never-fire behavior) |
+| `0067` opencl | Ten missing 2.x APIs bridged as passthroughs: CloneKernel, CQ/SamplerWithProperties, ProgramWithIL, Pipe/PipeInfo, SubGroupInfo, DeviceAndHostTimer, HostTimer, SetDefaultDeviceCommandQueue |
+| `0068` opencl | Full SVM family bridged: SVMAlloc/Free, SetKernelArgSVMPointer, SVMMemcpy/MemFill/Map/Unmap/MigrateMem (verified coarse-grain on NVIDIA) |
+
+Full-pipeline proof: `Test-OpenCL-Compute.sh` builds from source, runs a
+1024-element kernel with bit-exact readback, then exercises async-notify,
+destructor (exactly-once), native kernels (event + NULL-event), all ten
+`0067` APIs and a coarse-grain SVM roundtrip. Still stubbed by design:
+context-creation error callbacks (no host error text to synthesize) and
+untracked-foreign destructor handles (never-fire beats use-after-free).
+
 ## Numbering notes
 
 - **`0024`/`0025` are deliberate gaps, not dropped patches.** The alt 11.11 set
