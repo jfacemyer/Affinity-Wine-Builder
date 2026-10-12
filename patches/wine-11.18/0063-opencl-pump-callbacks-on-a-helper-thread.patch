@@ -1,0 +1,75 @@
+From: ElementalWarrior
+Date: 2026-10-12
+Subject: Pump OpenCL event callbacks from a helper thread
+
+Deliver OpenCL event callbacks from a pumper thread so waits that make
+no further OpenCL calls still complete.
+
+Callbacks fire as a side effect of later OpenCL calls (0012, kept cheap
+by 0017/0030/0031). Affinity registers a completion callback at startup
+and then waits for it without calling back into OpenCL, so with nothing
+pumping the queue the callback never fires and startup hangs with OpenCL
+enabled -- the reason GPU support has to stay disabled.
+
+Start one helper thread per process on the first queued callback. While
+callbacks are pending it pumps every millisecond; idle it sleeps 50 ms,
+so an unused prefix pays one sleeping thread and no polling. Callbacks
+still run one at a time through check_completed_callbacks(), and every
+existing synchronous pump point is kept, so behavior with an active
+caller is unchanged. Per the OpenCL spec the driver may invoke callbacks
+from any thread; the handler only signals completion.
+
+--- a/dlls/opencl/pe_thunks.c	2026-10-12 09:30:20.149554528 -0300
++++ b/dlls/opencl/pe_thunks.c	2026-10-12 09:30:20.141250178 -0300
+@@ -23,6 +23,43 @@ struct event_callback
+ struct event_callback *callback_list;
+ static SRWLOCK callback_lock = SRWLOCK_INIT;
+ static LONG pending_callbacks;
++static LONG callback_pumper_started;
++
++static void check_completed_callbacks(void);
++
++/* Pumps queued event callbacks while the application waits without making
++ * further OpenCL calls (see clSetEventCallback). One thread per process;
++ * idle cost is a single thread sleeping 50 ms at a time. */
++static DWORD WINAPI callback_pumper_thread( void *arg )
++{
++    (void)arg;
++    for (;;)
++    {
++        if (pending_callbacks)
++        {
++            check_completed_callbacks();
++            Sleep( 1 );
++        }
++        else Sleep( 50 );
++    }
++    return 0;
++}
++
++static void start_callback_pumper(void)
++{
++    HANDLE thread;
++
++    if (InterlockedCompareExchange( &callback_pumper_started, 1, 0 ) != 0)
++        return;
++    thread = CreateThread( NULL, 0, callback_pumper_thread, NULL, 0, NULL );
++    if (thread)
++    {
++        TRACE( "started OpenCL callback pumper thread\n" );
++        CloseHandle( thread );
++    }
++    else
++        InterlockedExchange( &callback_pumper_started, 0 );
++}
+ 
+ static void check_completed_callbacks(void)
+ {
+@@ -776,6 +813,7 @@ cl_int WINAPI clSetEventCallback( cl_eve
+     callback_list = cb;
+     ReleaseSRWLockExclusive(&callback_lock);
+ 
++    start_callback_pumper();
+     check_completed_callbacks();
+ 
+     return CL_SUCCESS;

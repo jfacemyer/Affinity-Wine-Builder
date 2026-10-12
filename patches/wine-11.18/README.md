@@ -26,6 +26,20 @@ harder than leaving it stubbed.
 Verified against a pristine `wine-11.18.tar.xz` (2026-10-01): `0032`–`0049`
 apply in order with no fuzz.
 
+`0050`–`0061` are 11.18-only fixes, in order (see `0059`/`0054` notes
+below). `0062`–`0063` are new OpenCL-forward-progress work so GPU support
+can stay **on** instead of disabled:
+
+| | |
+|---|---|
+| `0062` opencl | `clFlush` submits the queue for real (+ pumps due callbacks). `0030` had made it `return CL_SUCCESS`; with nothing submitted a startup wait never ends |
+| `0063` opencl | Callback pumper thread: one helper per process pumps queued event callbacks every 1 ms while pending (50 ms idle sleep). Fixes the register-callback-then-wait-without-further-calls startup hang; callbacks still run serially through `check_completed_callbacks()` |
+
+Repro: `ocl-repro.c` pattern (user event + `CL_COMPLETE` callback, setter
+thread completes it, main thread waits 5 s with no further CL calls) hangs
+on `0061` and passes with `0062`–`0063`. Module `dlls/opencl` builds
+warning-free (only pre-existing `0021` `invalidate_kernel_args` warning).
+
 ## Numbering notes
 
 - **`0024`/`0025` are deliberate gaps, not dropped patches.** The alt 11.11 set
