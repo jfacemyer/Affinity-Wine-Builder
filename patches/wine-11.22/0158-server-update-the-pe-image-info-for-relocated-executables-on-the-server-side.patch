@@ -1,0 +1,38 @@
+From 3b569f32acffc0b21506a46e3560f7296de0219f Mon Sep 17 00:00:00 2001
+From: Alexandre Julliard <julliard@winehq.org>
+Date: Mon, 16 Nov 2026 17:22:23 +0100
+Subject: [PATCH] server: Update the PE image info for relocated executables on
+ the server side.
+
+Backport of upstream commit d87fb2f52ea9379a3bb04dd1753b46af805141da.
+---
+ dlls/ntdll/unix/virtual.c | 3 +--
+ server/mapping.c          | 1 +
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index c6b9aef..e8a93a5 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -6366,8 +6366,7 @@ NTSTATUS WINAPI NtUnmapViewOfSectionEx( HANDLE process, PVOID addr, ULONG flags
+  */
+ void virtual_fill_image_information( const struct pe_image_info *pe_info, SECTION_IMAGE_INFORMATION *info )
+ {
+-    client_ptr_t base = pe_info->map_addr ? pe_info->map_addr : pe_info->base;
+-    info->TransferAddress             = wine_server_get_ptr( base + pe_info->entry_point );
++    info->TransferAddress             = wine_server_get_ptr( pe_info->base + pe_info->entry_point );
+     info->ZeroBits                    = pe_info->zerobits;
+     info->MaximumStackSize            = pe_info->stack_size;
+     info->CommittedStackSize          = pe_info->stack_commit;
+diff --git a/server/mapping.c b/server/mapping.c
+index d1b0fc3..4264ba5 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -461,6 +461,7 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
+             if (get_view_nt_name( view, &name ) && (process->image = memdup( name.str, name.len )))
+                 process->imagelen = name.len;
+             process->image_info = view->image;
++            process->image_info.base = view->base;
+             list_add_head( &process->views, &view->entry );
+             return 1;
+         }
