@@ -12,7 +12,11 @@ The Vulkan renderer creates its swapchain on first use for the same
 reason.
 
 Presents made while a context is still on the backup window go through
-the GDI path, as they do when a context falls back to it.
+the GDI path, as they do when a context falls back to it. The backup
+window is taken from the context's device, not the swapchain's: when a
+swapchain's back buffer is unloaded after the swapchain was freed, the
+context still points at the freed swapchain (the d2d1 tests crashed on
+its device pointer).
 ---
  dlls/wined3d/context_gl.c | 36 ++++++++++++++++++++++++++++--------
  dlls/wined3d/swapchain.c  |  3 +++
@@ -36,7 +40,7 @@ index e5b41ff..fe7d222 100644
 +
 +    if (wined3d_swapchain_gl(swapchain)->attached)
 +        dc = swapchain->dc;
-+    else if (!(dc = wined3d_device_gl_get_backup_dc(wined3d_device_gl(swapchain->device))))
++    else if (!(dc = wined3d_device_gl_get_backup_dc(wined3d_device_gl(context_gl->c.device))))
          return;
  
 -    if (context_gl->window == context_gl->c.swapchain->win_handle &&
