@@ -1,0 +1,212 @@
+From c1b34c766cfe2e528ebf5971832b3d9e734f5022 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 08:32:07 -0500
+Subject: [PATCH] wineboot, kernelbase, shell32, winspool: Cope with a
+ temporary folder from another user.
+
+Wine stores the user's TEMP and TMP as the full path of the profile's
+Temp folder, C:\users\<name>\AppData\Local\Temp, and fills them in only
+when they are missing. A prefix made by one user and run by another
+(copied, or shipped inside an AppImage) keeps the first user's path,
+which does not exist. Programs then get a temporary folder they cannot
+write to, and winspool, which writes each printer's PPD file there
+before adding it, adds no printers at all: Affinity said "No printers
+installed" while CUPS had several.
+
+- shell32 stores them the way Windows does, %USERPROFILE%\AppData\Local\
+  Temp, so a new prefix works under any user name.
+- wineboot, on every start, points a TEMP or TMP that names a folder
+  that does not exist at this user's Temp, and creates it.
+- GetTempPath() skips a TMP or TEMP that is not a folder and goes on to
+  the next candidate, as if it were not set. This covers the first
+  process of a session, whose environment was read before wineboot ran.
+- winspool falls back to the Windows folder's Temp when it cannot create
+  its PPD folder, rather than adding no printers.
+
+With a prefix made under another user name, as the published AppImage
+is, 0 printers before and all 9 CUPS printers after.
+---
+ dlls/kernelbase/file.c       | 26 +++++++++++++++++--
+ dlls/shell32/shellpath.c     | 27 ++++++++++++++-----
+ dlls/winspool.drv/info.c     | 18 ++++++++++++-
+ programs/wineboot/wineboot.c | 50 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 112 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/kernelbase/file.c b/dlls/kernelbase/file.c
+index 7b0f0a6..da2e687 100644
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -2546,13 +2546,35 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetTempPathA( DWORD count, LPSTR path )
+ /***********************************************************************
+  *	GetTempPathW   (kernelbase.@)
+  */
++/* TMP or TEMP naming a folder that does not exist, typically a prefix made by
++ * another user, whose stored temporary folder is under that user's profile. */
++static BOOL temp_dir_missing( const WCHAR *var, WCHAR *tmp_path, UINT *ret )
++{
++    WCHAR full[MAX_PATH];
++    DWORD attrs;
++    UINT len;
++
++    if (!(*ret = GetEnvironmentVariableW( var, tmp_path, MAX_PATH ))) return TRUE;
++    if (*ret > MAX_PATH) return FALSE;
++    if (!(len = GetFullPathNameW( tmp_path, MAX_PATH, full, NULL )) || len >= MAX_PATH) return FALSE;
++    attrs = GetFileAttributesW( full );
++    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return FALSE;
++    WARN( "%s is %s, which is not a folder, skipping it.\n", debugstr_w(var), debugstr_w(full) );
++    *ret = 0;
++    return TRUE;
++}
++
+ DWORD WINAPI DECLSPEC_HOTPATCH GetTempPathW( DWORD count, LPWSTR path )
+ {
+     WCHAR tmp_path[MAX_PATH];
+     UINT ret;
+ 
+-    if (!(ret = GetEnvironmentVariableW( L"TMP", tmp_path, MAX_PATH )) &&
+-        !(ret = GetEnvironmentVariableW( L"TEMP", tmp_path, MAX_PATH )) &&
++    /* Windows does not check that the folder exists. A program cannot do
++     * anything with a temporary folder that is not there, though, and Wine's
++     * own components (winspool's PPD files) then fail silently, so fall
++     * through to the next candidate as if the variable were not set. */
++    if (temp_dir_missing( L"TMP", tmp_path, &ret ) &&
++        temp_dir_missing( L"TEMP", tmp_path, &ret ) &&
+         !(ret = GetEnvironmentVariableW( L"USERPROFILE", tmp_path, MAX_PATH )) &&
+         !(ret = GetWindowsDirectoryW( tmp_path, MAX_PATH )))
+         return 0;
+diff --git a/dlls/shell32/shellpath.c b/dlls/shell32/shellpath.c
+index ccc44d0..77126c3 100644
+--- a/dlls/shell32/shellpath.c
++++ b/dlls/shell32/shellpath.c
+@@ -3335,12 +3335,27 @@ static HRESULT create_extra_folders(void)
+                                     SHGFP_TYPE_DEFAULT, L"Temp", path );
+     if (SUCCEEDED(hr))
+     {
+-        size = sizeof(path);
+-        if (RegQueryValueExW( hkey, L"TEMP", NULL, &type, (LPBYTE)path, &size ))
+-            RegSetValueExW( hkey, L"TEMP", 0, REG_SZ, (LPBYTE)path, (lstrlenW(path) + 1) * sizeof(WCHAR) );
+-        size = sizeof(path);
+-        if (RegQueryValueExW( hkey, L"TMP", NULL, &type, (LPBYTE)path, &size ))
+-            RegSetValueExW( hkey, L"TMP", 0, REG_SZ, (LPBYTE)path, (lstrlenW(path) + 1) * sizeof(WCHAR) );
++        static const WCHAR default_temp[] = L"%USERPROFILE%\\AppData\\Local\\Temp";
++        WCHAR value[MAX_PATH], profile[MAX_PATH];
++        const BYTE *data = (const BYTE *)path;
++        DWORD data_size = (lstrlenW(path) + 1) * sizeof(WCHAR), data_type = REG_SZ;
++
++        /* Store it the way Windows does, relative to the profile, so that the
++         * prefix still works when another user runs it. */
++        if (SUCCEEDED(SHGetFolderPathW( 0, CSIDL_PROFILE, NULL, SHGFP_TYPE_DEFAULT, profile )) &&
++                !wcsnicmp( path, profile, lstrlenW(profile) ) &&
++                !wcsicmp( path + lstrlenW(profile), L"\\AppData\\Local\\Temp" ))
++        {
++            data = (const BYTE *)default_temp;
++            data_size = sizeof(default_temp);
++            data_type = REG_EXPAND_SZ;
++        }
++        size = sizeof(value);
++        if (RegQueryValueExW( hkey, L"TEMP", NULL, &type, (LPBYTE)value, &size ))
++            RegSetValueExW( hkey, L"TEMP", 0, data_type, data, data_size );
++        size = sizeof(value);
++        if (RegQueryValueExW( hkey, L"TMP", NULL, &type, (LPBYTE)value, &size ))
++            RegSetValueExW( hkey, L"TMP", 0, data_type, data, data_size );
+     }
+     RegCloseKey( hkey );
+ 
+diff --git a/dlls/winspool.drv/info.c b/dlls/winspool.drv/info.c
+index 5f09015..a2ee685 100644
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -700,8 +700,24 @@ static WCHAR *get_ppd_dir( void )
+     res = CreateDirectoryW( dir, NULL );
+     if (!res && GetLastError() != ERROR_ALREADY_EXISTS)
+     {
++        /* Without this folder no printer can be added at all, so rather than
++         * give up, use the Windows folder's Temp. */
++        WARN( "cannot create %s, error %lu\n", debugstr_w(dir), GetLastError() );
+         free( dir );
+-        dir = NULL;
++        len = GetWindowsDirectoryW( tmp_path, ARRAY_SIZE( tmp_path ) - 6 );
++        if (!len || len >= ARRAY_SIZE( tmp_path ) - 6) return NULL;
++        lstrcatW( tmp_path, L"\\temp\\" );
++        CreateDirectoryW( tmp_path, NULL );
++        len = lstrlenW( tmp_path );
++        if (!(dir = malloc( len * sizeof(WCHAR) + sizeof(wine_ppds) ))) return NULL;
++        memcpy( dir, tmp_path, len * sizeof(WCHAR) );
++        memcpy( dir + len, wine_ppds, sizeof(wine_ppds) );
++        res = CreateDirectoryW( dir, NULL );
++        if (!res && GetLastError() != ERROR_ALREADY_EXISTS)
++        {
++            free( dir );
++            dir = NULL;
++        }
+     }
+     TRACE( "ppd temporary dir: %s\n", debugstr_w(dir) );
+     return dir;
+diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
+index 3cfc7c9..024acd6 100644
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -863,6 +863,55 @@ static void create_computer_name_keys(void)
+     RegCloseKey( key );
+ }
+ 
++/* The user's TEMP and TMP, if they name a folder that does not exist. Wine
++ * stores them as the full path of the user's Temp folder, and a prefix made
++ * by one user and used by another (copied, packaged in an AppImage) keeps the
++ * first user's: nothing can then write temporary files, and winspool adds no
++ * printers. Point them at this user's Temp, the way Windows stores them. */
++static void fix_user_temp_dirs(void)
++{
++    static const WCHAR default_temp[] = L"%USERPROFILE%\\AppData\\Local\\Temp";
++    static const WCHAR *names[] = { L"TEMP", L"TMP" };
++    WCHAR profile[MAX_PATH], value[MAX_PATH], expanded[MAX_PATH * 2];
++    DWORD type, size, attrs, len;
++    unsigned int i;
++    HKEY hkey;
++
++    if (FAILED(SHGetFolderPathW( NULL, CSIDL_PROFILE | CSIDL_FLAG_CREATE, NULL, SHGFP_TYPE_CURRENT, profile )))
++        return;
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, L"Environment", 0, KEY_ALL_ACCESS, &hkey )) return;
++
++    for (i = 0; i < ARRAY_SIZE(names); i++)
++    {
++        size = sizeof(value);
++        if (RegQueryValueExW( hkey, names[i], NULL, &type, (BYTE *)value, &size )) continue;
++        if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
++        value[ARRAY_SIZE(value) - 1] = 0;
++        if (!wcsicmp( value, default_temp )) continue;
++
++        /* %USERPROFILE% is not in this process's environment yet. */
++        len = lstrlenW( L"%USERPROFILE%" );
++        if (type == REG_EXPAND_SZ && !wcsnicmp( value, L"%USERPROFILE%", len ))
++            swprintf( expanded, ARRAY_SIZE(expanded), L"%s%s", profile, value + len );
++        else if (type == REG_EXPAND_SZ)
++        {
++            if (!ExpandEnvironmentStringsW( value, expanded, ARRAY_SIZE(expanded) )) continue;
++        }
++        else lstrcpynW( expanded, value, ARRAY_SIZE(expanded) );
++        if (wcschr( expanded, '%' )) continue;  /* cannot tell */
++
++        attrs = GetFileAttributesW( expanded );
++        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) continue;
++
++        WINE_TRACE( "%s was %s, which does not exist; using %s.\n", debugstr_w(names[i]),
++                    debugstr_w(value), debugstr_w(default_temp) );
++        swprintf( expanded, ARRAY_SIZE(expanded), L"%s\\AppData\\Local\\Temp", profile );
++        SHCreateDirectoryExW( NULL, expanded, NULL );
++        RegSetValueExW( hkey, names[i], 0, REG_EXPAND_SZ, (const BYTE *)default_temp, sizeof(default_temp) );
++    }
++    RegCloseKey( hkey );
++}
++
+ static void create_volatile_environment_registry_key(void)
+ {
+     WCHAR path[MAX_PATH];
+@@ -1940,6 +1989,7 @@ int __cdecl main( int argc, char *argv[] )
+     if (init || update) update_wineprefix( update );
+ 
+     create_volatile_environment_registry_key();
++    fix_user_temp_dirs();
+     create_known_dlls();
+     initialize_internet();
+     create_sqmclient_registry_key();
