@@ -1,0 +1,126 @@
+From 416c4c9049cd220107d3801829901e3352df2fd2 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 07:48:58 -0500
+Subject: [PATCH] explorer: Show /select objects in the desktop's file manager.
+
+Programs run "explorer /select,<file>" for "Show in Explorer": Affinity's
+Resource Manager does, and opened Wine's own explorer window, while the
+rest of Wine hands folders and files to the desktop through xdg-open.
+
+When the object exists, ask the desktop's file manager to show it over
+D-Bus, with org.freedesktop.FileManager1.ShowItems: Dolphin, Nautilus,
+Nemo, Thunar and others implement it, and it opens the folder with the
+file selected. Without an answer within ten seconds, open the folder with
+xdg-open instead. If neither can be started, Wine's explorer opens as
+before. Other explorer command lines are unchanged.
+---
+ programs/explorer/explorer.c | 79 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+diff --git a/programs/explorer/explorer.c b/programs/explorer/explorer.c
+index 1854144..fb5aef8 100644
+--- a/programs/explorer/explorer.c
++++ b/programs/explorer/explorer.c
+@@ -34,6 +34,8 @@
+ #include <shlwapi.h>
+ #include <commoncontrols.h>
+ #include <commctrl.h>
++#include <winternl.h>
++#include <stdlib.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(explorer);
+ 
+@@ -911,6 +913,81 @@ static void parse_command_line(LPWSTR commandline,parameters_struct *parameters)
+     }
+ }
+ 
++/* A file:// URI for a Unix path, percent-encoding all but the unreserved
++ * characters and '/'. */
++static char *unix_path_to_uri( const char *path )
++{
++    static const char hex[] = "0123456789ABCDEF";
++    char *uri, *d;
++
++    if (!(uri = malloc( sizeof("file://") + 3 * strlen( path ) ))) return NULL;
++    d = uri + sprintf( uri, "file://" );
++    for (; *path; path++)
++    {
++        unsigned char c = *path;
++        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
++            strchr( "/-_.~", c ))
++            *d++ = c;
++        else
++        {
++            *d++ = '%';
++            *d++ = hex[c >> 4];
++            *d++ = hex[c & 15];
++        }
++    }
++    *d = 0;
++    return uri;
++}
++
++/* explorer /select,<object> opens the object's folder with the object
++ * selected. Programs use it for "Show in Explorer"; Wine's own explorer
++ * window is a poor stand-in for the desktop's file manager, which the rest of
++ * Wine already hands folders and files to through xdg-open. Ask the file
++ * manager to show the object over D-Bus (org.freedesktop.FileManager1, which
++ * Dolphin, Nautilus, Nemo, Thunar and others implement, and which selects
++ * it), or failing that open its folder with xdg-open. Returns FALSE when
++ * neither could be asked, and Wine's explorer opens as before. */
++static BOOL show_in_host_file_manager( const WCHAR *object )
++{
++    char *unix_path, *uri, *slash, *items;
++    BOOL shown = FALSE;
++    int len;
++
++    if (!object[0] || GetFileAttributesW( object ) == INVALID_FILE_ATTRIBUTES) return FALSE;
++    if (!(unix_path = wine_get_unix_file_name( object ))) return FALSE;
++
++    if ((uri = unix_path_to_uri( unix_path )))
++    {
++        len = strlen( uri ) + sizeof("array:string:");
++        if ((items = malloc( len )))
++        {
++            char *dbus_argv[] = { (char *)"dbus-send", (char *)"--session", (char *)"--print-reply",
++                                  (char *)"--reply-timeout=10000",
++                                  (char *)"--dest=org.freedesktop.FileManager1",
++                                  (char *)"/org/freedesktop/FileManager1",
++                                  (char *)"org.freedesktop.FileManager1.ShowItems",
++                                  items, (char *)"string:", NULL };
++            snprintf( items, len, "array:string:%s", uri );
++            shown = !__wine_unix_spawnvp( dbus_argv, TRUE );
++            TRACE( "ShowItems %s: %s\n", debugstr_a(uri), shown ? "shown" : "no file manager answered" );
++            free( items );
++        }
++        free( uri );
++    }
++
++    if (!shown && (slash = strrchr( unix_path, '/' )))
++    {
++        char *xdg_argv[] = { (char *)"xdg-open", unix_path, NULL };
++        if (slash == unix_path) slash[1] = 0;
++        else *slash = 0;
++        shown = !__wine_unix_spawnvp( xdg_argv, FALSE );
++        TRACE( "xdg-open %s: %s\n", debugstr_a(unix_path), shown ? "started" : "failed" );
++    }
++
++    HeapFree( GetProcessHeap(), 0, unix_path );
++    return shown;
++}
++
+ int WINAPI wWinMain(HINSTANCE hinstance,
+                     HINSTANCE previnstance,
+                     LPWSTR cmdline,
+@@ -924,6 +1001,8 @@ int WINAPI wWinMain(HINSTANCE hinstance,
+     memset(&parameters,0,sizeof(parameters));
+     explorer_hInstance = hinstance;
+     parse_command_line(cmdline,&parameters);
++    if (parameters.selection[0] && show_in_host_file_manager( parameters.selection ))
++        ExitProcess(EXIT_SUCCESS);
+     hres = OleInitialize(NULL);
+     if(FAILED(hres))
+     {
+-- 
+2.56.0
+
